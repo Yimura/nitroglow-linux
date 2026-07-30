@@ -37,6 +37,13 @@ Error: Read failed
 
 `i2c-13` is `AMDGPU DM i2c OEM bus`. Every address fails the same way. Note that `amdgpu_dm_i2c_xfer()` returns `-EIO` identically for a NULL ddc_pin, a failed START and a failed address ACK, so the errno carries no diagnostic information here.
 
+To be explicit about method, since this class of report has previously turned out to be userspace probing the wrong bus (issue #4478): **only the OEM bus is targeted, with single-address reads, and no bus scanning is performed at any point.** That is precisely the guidance given in that issue —
+
+> The i2c bus used for OEM stuff should have `OEM` in the name. Can you target that one specifically?
+> — @agd5f, [#4478](https://gitlab.freedesktop.org/drm/amd/-/issues/4478)
+
+— and doing exactly that still fails, on every address, before the address phase.
+
 ## Root cause
 
 `hw_ddc.c:84-87` reads the pull-down enables:
@@ -106,6 +113,8 @@ The device is the board's RGB controller, which this card's VBIOS declares in `f
 
 Tool and full analysis: https://github.com/Yimura/nitroglow-linux
 
+To be clear about what is being asked: this is **not** a request to bless userspace i2c poking, and no change in userspace behaviour is being sought. The bit-bang result is offered solely as evidence that the pads are wired, the pull-ups exist and a device responds — i.e. that the kernel-side failure is not a device-absent condition.
+
 ## Regression status: none — this has never worked
 
 - The `DC_GPIO_DDC1CLK_PD_EN` read and the guard consuming it date to the original DC import, `4562236b3bc0` (2017).
@@ -122,9 +131,24 @@ Giving the VGA line a mask list without `CLK_PD_EN` is the obvious alternative, 
 
 I have not submitted a patch and am not planning to. Happy to test any patch on this hardware and report back.
 
+## Related issues
+
+- **[#4478](https://gitlab.freedesktop.org/drm/amd/-/issues/4478)** — Sapphire RX 9070 XT freezes with OpenRGB, closed as an OpenRGB problem. That diagnosis was correct there: OpenRGB was probing buses indiscriminately. It has since been fixed on the OpenRGB side by matching on bus name ([MR 2950](https://gitlab.com/CalcProgrammer1/OpenRGB/-/merge_requests/2950)), which is why current OpenRGB only touches buses named `AMD ADL`, `AMDGPU DM i2c OEM bus` or `AMDGPU i2c bit bus OEM 0x97`. This report is the opposite situation: the correct bus, targeted specifically, with no scanning — and it still cannot complete a transfer.
+- **[#3065](https://gitlab.freedesktop.org/drm/amd/-/issues/3065)** — RGB on the 7900 XTX reference cooler. Relevant only as context for what sits on these buses; the request there is for a new interface, whereas this report is that an existing one does not work.
+- **[#5057](https://gitlab.freedesktop.org/drm/amd/-/issues/5057)** — dead DC i2c on ppc64le. Superficially similar symptoms (GPIO readback zeros), but a different root cause: VBIOS never POSTed. Noted only to distinguish it.
+
 ## Related, separate
 
-`amdgpu_i2c_init()` is only called in the `else` arm of `if (adev->is_atom_fw)` (`amdgpu_device.c:3987-4007`), so it never runs on Vega and later. As a result `amdgpu_atombios_oem_i2c_init()` — which produces the adapter name `AMDGPU i2c bit bus OEM 0x97` — is unreachable on those ASICs, and the legacy `GPIO_I2C_Info` table it parses does not exist in an atomfirmware image anyway. That is an enablement gap rather than a bug, so it is not filed here; happy to open a separate issue if it is of interest.
+`amdgpu_i2c_init()` is only called in the `else` arm of `if (adev->is_atom_fw)` (`amdgpu_device.c:3987-4007`), so it never runs on Vega and later. As a result `amdgpu_atombios_oem_i2c_init()` — which produces the adapter name `AMDGPU i2c bit bus OEM 0x97` — is unreachable on those ASICs, and the legacy `GPIO_I2C_Info` table it parses does not exist in an atomfirmware image anyway.
+
+This bears on a statement in #4478:
+
+> I think it will always be the OEM i2c bus for amdgpu. Unless the user has explicitly disabled DC, in which case it would be the 0x97 i2c bus. It's the same i2c bus in both cases, just has different names for historical reasons.
+> — @agd5f, [#4478](https://gitlab.freedesktop.org/drm/amd/-/issues/4478)
+
+That matches what is observed here — same pads either way — but on an atomfirmware ASIC the `dc=0` alternative cannot arise at all, because the code path producing the `0x97` name is never reached regardless of the `dc` parameter. So on Vega and later there is only the DC path, and if that path cannot transfer, there is no fallback.
+
+That is an enablement gap rather than a bug, so it is not filed here; happy to open a separate issue if it is of interest.
 
 ---
 
