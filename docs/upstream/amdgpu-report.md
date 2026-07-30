@@ -77,7 +77,7 @@ To be explicit about method, since this class of report has previously turned ou
 [`hw_ddc.c:84-87`][hw_ddc84] reads the pull-down enables:
 
 ```c
-REG_GET_3(gpio.MASK_reg,
+regval = REG_GET_3(gpio.MASK_reg,
         DC_GPIO_DDC1DATA_PD_EN, &ddc_data_pd_en,
         DC_GPIO_DDC1CLK_PD_EN, &ddc_clk_pd_en,
         AUX_PAD1_MODE, &aux_pad_mode);
