@@ -75,7 +75,7 @@ $ grep -c 'DC_GPIO_DDCVGA_MASK__DC_GPIO_DDCVGACLK_PD_EN' dcn_2_0_0_sh_mask.h
 0
 ```
 
-`DC_GPIO_DDCVGA_MASK` has no `CLK_PD_EN` field. The read therefore returns 0 unconditionally, the guard at [`hw_ddc.c:96`][hw_ddc96]
+`DC_GPIO_DDCVGA_MASK` has no `CLK_PD_EN` field ([`dcn_2_0_0_sh_mask.h`][shmask] — the field is simply absent, whereas `DC_GPIO_DDC1_MASK__DC_GPIO_DDC1CLK_PD_EN` is present). The read therefore returns 0 unconditionally, the guard at [`hw_ddc.c:96`][hw_ddc96]
 
 ```c
 if (!ddc_data_pd_en || !ddc_clk_pd_en) {
