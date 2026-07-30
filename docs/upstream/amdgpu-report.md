@@ -10,6 +10,19 @@ Scope: this reports the DC software-i2c bug only. The separate `amdgpu_i2c_init(
 
 ---
 
+## Disclosure: AI-assisted analysis, human-verified
+
+This investigation made heavy use of AI assistance — cross-referencing kernel sources, triaging decompiler output, and drafting this report. Stating that up front because it should inform how you read it, not because it changes what is claimed.
+
+Everything asserted here was verified against primary sources rather than taken on trust:
+
+- **Code citations** are against v7.1.5 and can be checked line by line.
+- **Register values** are direct readbacks from the hardware on my machine, not reconstructions.
+- **The device's i2c line and address** were derived twice, independently: from this card's own VBIOS tables, and from reverse engineering Sapphire's TriXX.
+- **Every hardware claim was reproduced on the machine and confirmed by me at the keyboard**, including the working userspace transfer.
+
+Where something is inferred rather than observed, it is labelled as such — see the pre-2022 caveat under "Regression status". No logs, register values, commit hashes or code excerpts in this report are synthesized; if any citation does not check out, treat it as an error worth telling me about.
+
 ## Summary
 
 On Navi 10, the DDC line exposed as `AMDGPU DM i2c OEM bus` cannot complete an i2c transfer to any address. Every transfer fails identically, and it fails **before the address phase** — so this is not a device-absent condition.
