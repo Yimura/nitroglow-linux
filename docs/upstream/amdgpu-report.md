@@ -42,8 +42,16 @@ I have confirmed on hardware that a device is present on this line and is reacha
 
 - GPU: Sapphire Radeon RX 5700 XT Nitro+ — `1002:731F`, subsystem `1DA2:E409`, revision `0xC1` (Navi 10), at `0000:0e:00.0`
 - Kernel: 7.1.5 (Arch Linux, `7.1.5-arch1-2`)
+- Board: Gigabyte X570 AORUS XTREME, BIOS F39g (2025-03-11)
 - A second GPU (NVIDIA GTX 1080) is present but unrelated
-- **[FILL IN]** attach full `dmesg`
+- Full `dmesg` attached. MAC addresses and UUIDs are redacted; nothing else is altered.
+
+The affected bus, for reference:
+
+```
+$ i2cdetect -l | grep OEM
+i2c-13	i2c       	AMDGPU DM i2c OEM bus           	I2C adapter
+```
 
 ## What happens
 
@@ -174,9 +182,27 @@ That is an enablement gap rather than a bug, so it is not filed here; happy to o
 
 ## Before filing
 
-- Attach full `dmesg`
-- Optionally include `drm.debug=0x1e` output covering an attempted transfer on the OEM bus
-- Confirm the `i2c-13` bus number still matches on the running kernel (`i2cdetect -l`)
+Artifacts are collected in `~/Projects/nitroglow-re/filing/` (deliberately outside the public repo, since `dmesg` carries machine identifiers).
+
+| file | attach? | notes |
+|---|---|---|
+| `dmesg-redacted.txt` | **yes** | 2806 lines, 2 MACs and 5 UUIDs redacted, 13 lines touched. DMI, kernel and all 75 amdgpu/drm lines intact |
+| `dmesg.txt` | no | unredacted original, kept locally only |
+| `register-dump.txt` | yes | the MASK/Y readback backing the evidence table |
+| `repro.txt` | yes | kernel path failing and the userspace bit-bang succeeding, back to back |
+| `i2c-buses.txt` | optional | `i2cdetect -l` output confirming the bus name |
+| `system.txt` | optional | `uname -a`, `/etc/os-release`, `lspci -nnk` for the GPU |
+
+Done:
+
+- [x] Bus number confirmed still `i2c-13` / `AMDGPU DM i2c OEM bus`
+- [x] `dmesg` captured and redacted
+- [x] Register dump and reproducer re-captured fresh; values match the tables above exactly
+
+Optional, only if a maintainer asks:
+
+- `drm.debug=0x1e` output covering an attempted transfer on the OEM bus
+- Boot a pre-2022 kernel to convert the "Regression status" inference into an observation
 
 <!-- Source permalinks. All pinned to the v7.1.5 commit
      155b42bec9cbb6b8cdc47dd9bd09503a81fbe493 so they can never drift onto
