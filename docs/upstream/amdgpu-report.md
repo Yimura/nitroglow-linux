@@ -6,7 +6,14 @@ Scope: this reports the DC software-i2c bug only. The separate `amdgpu_i2c_init(
 
 ---
 
-**Title:** `drm/amd/display: DC software i2c engine cannot work on GPIO_DDC_LINE_DDC_VGA — read path missing the special case added in c0b2753f5db2`
+**Title:** `[RX 5700 XT / Navi 10] AMDGPU DM i2c OEM bus cannot complete any transfer — DC re-asserts the SDA pull-down on every open`
+
+Alternatives in the same house style, if you prefer a different emphasis:
+
+- `[Navi 10 / DCN 2.0] DC software i2c engine cannot transfer on the OEM (DDCVGA) line — every address fails before the address phase`
+- `[RX 5700 XT / Navi 10] OEM i2c bus dead — hw_ddc.c reads a CLK_PD_EN field that DC_GPIO_DDCVGA_MASK does not define`
+
+Note the tracker's convention is a bracketed hardware/ASIC tag followed by a plain-language symptom. Do **not** use a `drm/amd/display:` prefix here — that is patch-subject style for the mailing list, and no issue on this tracker uses it.
 
 ---
 
