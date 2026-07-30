@@ -16,7 +16,7 @@ This investigation made heavy use of AI assistance — cross-referencing kernel 
 
 Everything asserted here was verified against primary sources rather than taken on trust:
 
-- **Code citations** are against v7.1.5 and can be checked line by line.
+- **Code citations** are against v7.1.5 and every one is hyperlinked to the exact line, pinned to commit `155b42bec9cbb6b8cdc47dd9bd09503a81fbe493` — so the links cannot drift onto later code as the tree moves.
 - **Register values** are direct readbacks from the hardware on my machine, not reconstructions.
 - **The device's i2c line and address** were derived twice, independently: from this card's own VBIOS tables, and from reverse engineering Sapphire's TriXX.
 - **Every hardware claim was reproduced on the machine and confirmed by me at the keyboard**, including the working userspace transfer.
@@ -59,7 +59,7 @@ To be explicit about method, since this class of report has previously turned ou
 
 ## Root cause
 
-`hw_ddc.c:84-87` reads the pull-down enables:
+[`hw_ddc.c:84-87`][hw_ddc84] reads the pull-down enables:
 
 ```c
 REG_GET_3(gpio.MASK_reg,
@@ -68,20 +68,20 @@ REG_GET_3(gpio.MASK_reg,
         AUX_PAD1_MODE, &aux_pad_mode);
 ```
 
-All DDC lines, VGA included, use `DDC_MASK_SH_LIST_COMMON` (`ddc_regs.h:96-102`), which supplies DDC1 field positions. That is fine for DDC1-6, whose register layouts match. It is not fine for VGA:
+All DDC lines, VGA included, use `DDC_MASK_SH_LIST_COMMON` ([`ddc_regs.h:96-102`][ddc_regs96]), which supplies DDC1 field positions. That is fine for DDC1-6, whose register layouts match. It is not fine for VGA:
 
 ```
 $ grep -c 'DC_GPIO_DDCVGA_MASK__DC_GPIO_DDCVGACLK_PD_EN' dcn_2_0_0_sh_mask.h
 0
 ```
 
-`DC_GPIO_DDCVGA_MASK` has no `CLK_PD_EN` field. The read therefore returns 0 unconditionally, the guard at `hw_ddc.c:96`
+`DC_GPIO_DDCVGA_MASK` has no `CLK_PD_EN` field. The read therefore returns 0 unconditionally, the guard at [`hw_ddc.c:96`][hw_ddc96]
 
 ```c
 if (!ddc_data_pd_en || !ddc_clk_pd_en) {
 ```
 
-is always true, and the VGA branch added by `c0b2753f5db2` re-asserts the SDA pull-down on every open:
+is always true, and the VGA branch added by [`c0b2753f5db2`][c0b2753] ([`hw_ddc.c:97-99`][hw_ddc97]) re-asserts the SDA pull-down on every open:
 
 ```c
 if (hw_gpio->base.en == GPIO_DDC_LINE_DDC_VGA) {
@@ -94,7 +94,7 @@ if (hw_gpio->base.en == GPIO_DDC_LINE_DDC_VGA) {
 
 Nothing in `hw_ddc.c` clears it again.
 
-Downstream, this line can only use DC's software engine — `link == NULL` forces `hw_supported = false` at `link_ddc.c:131-134`, and `GPIO_DDC_LINE_DDC_VGA == 6` is not `< res_cap->num_ddc == 6` (`dcn20_resource.c:691`). `dce_i2c_sw.c:298-339 start_sync_sw` then releases SDA, reads it back at `:316`, never sees it rise, and gives up after `I2C_SW_RETRIES = 10` — before any address bit is transmitted. That is precisely the observed address-independent failure.
+Downstream, this line can only use DC's software engine — `link == NULL` forces `hw_supported = false` at [`link_ddc.c:131-134`][link_ddc131], and `GPIO_DDC_LINE_DDC_VGA == 6` is not `< res_cap->num_ddc == 6` ([`dcn20_resource.c:691`][dcn20_691]). [`start_sync_sw`][sw298] (`dce_i2c_sw.c:298-339`) then releases SDA, reads it back at [`:316`][sw316], never sees it rise, and gives up after `I2C_SW_RETRIES = 10` — before any address bit is transmitted. That is precisely the observed address-independent failure.
 
 The intent of `c0b2753f5db2` is not in dispute: it correctly recognised that bit 4 differs on this line and stopped writing it. The issue is only that the corresponding read was not given the same treatment.
 
@@ -130,9 +130,9 @@ To be clear about what is being asked: this is **not** a request to bless usersp
 
 ## Regression status: none — this has never worked
 
-- The `DC_GPIO_DDC1CLK_PD_EN` read and the guard consuming it date to the original DC import, `4562236b3bc0` (2017).
-- `b81e5aa39f66` (2018) only refactored the macro into `DDC_MASK_SH_LIST_COMMON`; no semantic change.
-- Before `c0b2753f5db2`, DC wrote bit 4 on the VGA line too — but since that bit is undefined on `DC_GPIO_DDCVGA_MASK` and reads back 0 on this hardware, the guard would have remained true then as well.
+- The `DC_GPIO_DDC1CLK_PD_EN` read and the guard consuming it date to the original DC import, [`4562236b3bc0`][c4562236] (2017).
+- [`b81e5aa39f66`][cb81e5aa] (2018) only refactored the macro into `DDC_MASK_SH_LIST_COMMON`; no semantic change.
+- Before [`c0b2753f5db2`][c0b2753], DC wrote bit 4 on the VGA line too — but since that bit is undefined on `DC_GPIO_DDCVGA_MASK` and reads back 0 on this hardware, the guard would have remained true then as well.
 
 That last point is inferred from the current register readback plus the missing field definition, not observed on a pre-2022 kernel. I can boot an older kernel and confirm directly if the distinction matters.
 
@@ -140,7 +140,7 @@ That last point is inferred from the current register readback plus the missing 
 
 Deferring to the maintainers on the right shape. The minimal change consistent with `c0b2753f5db2` would be to mirror its special case on the read side, so only `ddc_data_pd_en` is considered for `GPIO_DDC_LINE_DDC_VGA`.
 
-Giving the VGA line a mask list without `CLK_PD_EN` is the obvious alternative, but note that `DDC_MASK_SH_LIST_DCN2_VGA` currently embeds `DDC_MASK_SH_LIST_COMMON` (`ddc_regs.h:116-121`) and so inherits the field regardless — switching lists alone would not help.
+Giving the VGA line a mask list without `CLK_PD_EN` is the obvious alternative, but note that `DDC_MASK_SH_LIST_DCN2_VGA` currently embeds `DDC_MASK_SH_LIST_COMMON` ([`ddc_regs.h:116-121`][ddc_regs116]) and so inherits the field regardless — switching lists alone would not help.
 
 I have not submitted a patch and am not planning to. Happy to test any patch on this hardware and report back.
 
@@ -152,7 +152,7 @@ I have not submitted a patch and am not planning to. Happy to test any patch on 
 
 ## Related, separate
 
-`amdgpu_i2c_init()` is only called in the `else` arm of `if (adev->is_atom_fw)` (`amdgpu_device.c:3987-4007`), so it never runs on Vega and later. As a result `amdgpu_atombios_oem_i2c_init()` — which produces the adapter name `AMDGPU i2c bit bus OEM 0x97` — is unreachable on those ASICs, and the legacy `GPIO_I2C_Info` table it parses does not exist in an atomfirmware image anyway.
+`amdgpu_i2c_init()` is only called in the `else` arm of `if (adev->is_atom_fw)` ([`amdgpu_device.c:3988-4006`][amdgpu_dev3988], the call itself at `:4005`), so it never runs on Vega and later. As a result `amdgpu_atombios_oem_i2c_init()` — which produces the adapter name `AMDGPU i2c bit bus OEM 0x97` — is unreachable on those ASICs, and the legacy `GPIO_I2C_Info` table it parses does not exist in an atomfirmware image anyway.
 
 This bears on a statement in #4478:
 
@@ -170,3 +170,22 @@ That is an enablement gap rather than a bug, so it is not filed here; happy to o
 - Attach full `dmesg`
 - Optionally include `drm.debug=0x1e` output covering an attempted transfer on the OEM bus
 - Confirm the `i2c-13` bus number still matches on the running kernel (`i2cdetect -l`)
+
+<!-- Source permalinks. All pinned to the v7.1.5 commit
+     155b42bec9cbb6b8cdc47dd9bd09503a81fbe493 so they can never drift onto
+     later code. Verified line-by-line against that tree on 2026-07-31. -->
+
+[hw_ddc84]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/gpu/drm/amd/display/dc/gpio/hw_ddc.c?id=155b42bec9cbb6b8cdc47dd9bd09503a81fbe493#n84
+[hw_ddc96]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/gpu/drm/amd/display/dc/gpio/hw_ddc.c?id=155b42bec9cbb6b8cdc47dd9bd09503a81fbe493#n96
+[hw_ddc97]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/gpu/drm/amd/display/dc/gpio/hw_ddc.c?id=155b42bec9cbb6b8cdc47dd9bd09503a81fbe493#n97
+[ddc_regs96]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/gpu/drm/amd/display/dc/gpio/ddc_regs.h?id=155b42bec9cbb6b8cdc47dd9bd09503a81fbe493#n96
+[ddc_regs116]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/gpu/drm/amd/display/dc/gpio/ddc_regs.h?id=155b42bec9cbb6b8cdc47dd9bd09503a81fbe493#n116
+[sw298]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/gpu/drm/amd/display/dc/dce/dce_i2c_sw.c?id=155b42bec9cbb6b8cdc47dd9bd09503a81fbe493#n298
+[sw316]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/gpu/drm/amd/display/dc/dce/dce_i2c_sw.c?id=155b42bec9cbb6b8cdc47dd9bd09503a81fbe493#n316
+[link_ddc131]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c?id=155b42bec9cbb6b8cdc47dd9bd09503a81fbe493#n131
+[dcn20_691]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/gpu/drm/amd/display/dc/resource/dcn20/dcn20_resource.c?id=155b42bec9cbb6b8cdc47dd9bd09503a81fbe493#n691
+[amdgpu_dev3988]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c?id=155b42bec9cbb6b8cdc47dd9bd09503a81fbe493#n3988
+[shmask]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/gpu/drm/amd/include/asic_reg/dcn/dcn_2_0_0_sh_mask.h?id=155b42bec9cbb6b8cdc47dd9bd09503a81fbe493
+[c0b2753]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=c0b2753f5db281b07013899c79b5f06a614055f9
+[c4562236]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=4562236b3bc0a28aeb6ee93b2d8a849a4c4e1c7c
+[cb81e5aa]: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=b81e5aa39f66fa159beb449c47220cfb483f0d5f
