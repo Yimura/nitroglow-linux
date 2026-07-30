@@ -1,0 +1,20 @@
+# Never commit vendor binaries or anything derived from them.
+# See README "What is deliberately not in this repo".
+*.exe
+*.sys
+*.dll
+*.rom
+*.bin
+resources/
+decompiled/
+ghidra_proj/
+ref/
+
+# Ghidra headless output
+*.gpr
+*.rep/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/

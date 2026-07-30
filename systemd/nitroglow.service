@@ -1,0 +1,12 @@
+[Unit]
+Description=Apply Sapphire Nitro Glow lighting
+After=multi-user.target
+
+[Service]
+Type=oneshot
+# Adjust this path to wherever you cloned the repository.
+ExecStart=/opt/nitroglow-linux/bin/nitroglow apply --config /etc/nitroglow.conf
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,441 @@
+From: nitroglow-re VBIOS track
+Subject: [PROPOSAL - NOT BUILT, NOT APPLIED] drm/amdgpu: register the board OEM
+ i2c line as a bit-banging adapter on atomfirmware ASICs
+
+*** THIS IS A PROPOSAL ONLY. It has not been compiled, applied or loaded. ***
+
+Base: linux v7.1.5 (running kernel 7.1.5-arch1-2). Sources used for the context
+lines were fetched read-only into ref/linux-7.1.5/ from
+  https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/<path>?h=v7.1.5
+
+--------------------------------------------------------------------------------
+RATIONALE
+--------------------------------------------------------------------------------
+
+amdgpu already knows how to expose a board-specific ("OEM") i2c line as a plain
+i2c-algo-bit adapter driven over MMIO -- amdgpu_atombios_oem_i2c_init(), which
+produces the adapter name
+
+    "AMDGPU i2c bit bus OEM 0x97"
+
+(amdgpu_atombios.c:169 sprintf(stmp, "OEM 0x%x", i2c.i2c_id)
+ -> amdgpu_i2c.c:192-193 "AMDGPU i2c bit bus %s")
+
+This is byte-for-byte the string that OpenRGB whitelists at
+ref/OpenRGB/i2c_smbus/i2c_amd_gpu.h:23. However that path is unreachable on
+Navi 10 for three independent reasons:
+
+ 1. amdgpu_device.c:3987-4007 calls amdgpu_i2c_init() only in the `else` arm of
+    `if (adev->is_atom_fw)`. Navi 10 has is_atom_fw = true, so amdgpu_i2c_init()
+    is never called at all.
+ 2. amdgpu_i2c.c:220-234 gates the DC branch on
+    CHIP_POLARIS10/POLARIS11/POLARIS12 only.
+ 3. amdgpu_atombios_oem_i2c_init() walks the legacy GPIO_I2C_Info data table,
+    which does not exist in an atomfirmware image. Verified on this card's ROM:
+    master data table index 10 (file offset 0x92D6) == 0x0000.
+
+On atomfirmware the same information lives in two tables, and this card's VBIOS
+(Sapphire RX 5700 XT Nitro+, 1DA2:E409) states it explicitly:
+
+  firmwareinfo (master idx 4) @0xD240, rev 3.3, bytes at +0x30:
+      02 97 50 00
+      ^  ^  ^
+      |  |  +-- board_i2c_feature_slave_addr = 0x50 (8-bit wire format;
+      |  |      see amdgpu_ras_eeprom.c:184-194 for the convention on the
+      |  |      sibling field) -> 7-bit 0x28
+      |  +----- board_i2c_feature_gpio_id    = 0x97
+      +-------- board_i2c_feature_id         = 0x02 (== "OEM i2c present",
+                the same test DC does at bios_parser2.c:1934)
+
+  gpio_pin_lut (master idx 12) @0xCA82, rev 2.1, entry 12 @0xCAE6:
+      a9 5d 00 00 08 08 97 00
+      data_a_reg_index = 0x00005DA9, gpio_bitshift = 8,
+      gpio_mask_bitshift = 8, gpio_id = 0x97
+
+  0x5DA9 == DCN_BASE__INST0_SEG2 (0x34C0, navi10_ip_offset.h:269)
+          + mmDC_GPIO_DDCVGA_A  (0x28E9, dcn_2_0_0_offset.h:12860)
+
+The identification of the pad rests on that register arithmetic alone, not on
+any assumption about what the ATOM lane mux field conventionally means: with the
+same base, all eight distinct data_a_reg_index values in this ROM's gpio_pin_lut
+resolve to named DCN2.0 registers with no misses (0x5D91..0x5DA5 = DDC1_A..DDC6_A,
+0x5DA9 = DDCVGA_A, 0x5DB5 = HPD_A). For completeness, GPIO_DDC_LINE_I2C_PAD is
+not a possibility on this ASIC: there is no mmDC_GPIO_I2CPAD_* register block in
+dcn_2_0_0_offset.h, and hw_translate_dcn20.c:178 records it as
+"case REG(DC_GPIO_I2CPAD_A): not exit".
+
+i.e. the OEM line is the DC_GPIO_DDCVGA pin pair. DC does create a ddc_service
+for it and amdgpu_dm exposes it as "AMDGPU DM i2c OEM bus", but that path can
+only ever use DC's software engine (link == NULL forces hw_supported = false at
+link_ddc.c:131-134, and GPIO_DDC_LINE_DDC_VGA == 6 is not < res_cap->num_ddc == 6
+at dce_i2c_hw.c:454-458 / dcn20_resource.c:691). That is the only bus on the
+test machine that uses dc's software bit-bang engine at all, and a single-address
+read there returns -EIO for every address tried. Whether that is an empty bus or
+a defect in dc's software engine could not be determined by observation alone;
+this patch adds a second, independent access path to the same pads using the
+long-standing i2c-algo-bit implementation in amdgpu_i2c.c, which is both a fix
+if it is a dc defect and the cheapest experiment that distinguishes the two.
+
+Register derivation used below, all verified against the DCN 2.0 headers:
+  * Each DC_GPIO_* pad group is a fixed 4-register block MASK, A, EN, Y:
+    mmDC_GPIO_DDCVGA_MASK/_A/_EN/_Y = 0x28E8/0x28E9/0x28EA/0x28EB
+    (dcn_2_0_0_offset.h:12858-12864) -> MASK = A-1, EN = A+1, Y = A+2.
+  * In every DC_GPIO_DDC* register the clock bit is bit 0 (0x00000001) and the
+    data bit is bit 8 (0x00000100), in MASK/A/EN/Y alike
+    (dcn_2_0_0_sh_mask.h:49221-49245). dc hardcodes the same two bits at
+    hw_translate_dcn20.c:201 and :231. NB the ATOM entry supplies only the DATA
+    bit shift; that CLK is bit 0 is taken from the headers and from dc, not from
+    the VBIOS.
+  * The MASK/A/EN/Y stride is a property of the DC_GPIO_* pad blocks, not of the
+    register space as a whole (e.g. mmDC_GPIO_TX12_EN is an EN with no matching
+    A/Y). The helper below therefore refuses any LUT entry that is not flagged
+    I2C_HW_CAP, and additionally requires the entry to sit in the same
+    4-dword-strided block as at least one other I2C_HW_CAP entry, which is what
+    makes the derivation safe rather than merely convenient.
+  * RREG32(0x5DA9) is a direct MMIO access: 0x5DA9 << 2 == 0x176A4 == 95908,
+    inside the 512 KiB register window (dmesg: "register mmio size: 524288").
+
+Behaviour is unchanged for !is_atom_fw ASICs, and for is_atom_fw ASICs whose
+VBIOS does not set board_i2c_feature_id == 0x2 the new function returns
+immediately.
+
+--------------------------------------------------------------------------------
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_atomfirmware.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_atomfirmware.h
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_atomfirmware.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_atomfirmware.h
+@@ -45,5 +45,6 @@ bool amdgpu_atomfirmware_sram_ecc_supported(struct amdgpu_device *adev);
+ bool amdgpu_atomfirmware_ras_rom_addr(struct amdgpu_device *adev, uint8_t *i2c_address);
+ bool amdgpu_atomfirmware_mem_training_supported(struct amdgpu_device *adev);
+ bool amdgpu_atomfirmware_dynamic_boot_config_supported(struct amdgpu_device *adev);
++void amdgpu_atomfirmware_oem_i2c_init(struct amdgpu_device *adev);
+ int amdgpu_atomfirmware_get_fw_reserved_fb_size(struct amdgpu_device *adev);
+ int amdgpu_atomfirmware_asic_init(struct amdgpu_device *adev, bool fb_reset);
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_atomfirmware.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_atomfirmware.c
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_atomfirmware.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_atomfirmware.c
+@@ -24,7 +24,8 @@
+ #include <drm/amdgpu_drm.h>
+ #include "amdgpu.h"
+ #include "atomfirmware.h"
+ #include "amdgpu_atomfirmware.h"
++#include "amdgpu_i2c.h"
+ #include "atom.h"
+ #include "atombios.h"
+ #include "soc15_hw_ip.h"
+@@ -809,6 +810,221 @@ bool amdgpu_atomfirmware_ras_rom_addr(struct amdgpu_device *adev,
+ 	return false;
+ }
+ 
++/*
++ * Return true if gpio_pin[idx] sits in the same 4-dword-strided register block
++ * as at least one other I2C_HW_CAP entry, i.e. it really is one pad of a
++ * DC_GPIO_<pad>_{MASK,A,EN,Y} quad. Cheap structural check, no ASIC tables.
++ */
++static bool amdgpu_atomfirmware_gpio_pin_in_i2c_block(
++		struct atom_gpio_pin_lut_v2_1 *lut, int count, int idx)
++{
++	u32 a_reg = le32_to_cpu(lut->gpio_pin[idx].data_a_reg_index);
++	int i;
++
++	for (i = 0; i < count; i++) {
++		u32 other;
++
++		if (i == idx)
++			continue;
++		if (!(lut->gpio_pin[i].gpio_id & I2C_HW_CAP))
++			continue;
++
++		other = le32_to_cpu(lut->gpio_pin[i].data_a_reg_index);
++		if (other == a_reg)
++			continue;
++		if (a_reg > other && (a_reg - other) % 4 == 0)
++			return true;
++		if (other > a_reg && (other - a_reg) % 4 == 0)
++			return true;
++	}
++
++	return false;
++}
++
++/**
++ * amdgpu_atomfirmware_get_bus_rec_for_gpio_pin - build an i2c bus rec
++ * @pin: one atom_gpio_pin_assignment entry from the gpio_pin_lut data table
++ *
++ * atomfirmware images have no GPIO_I2C_Info table, so unlike
++ * amdgpu_atombios_get_bus_rec_for_i2c_gpio() we only get a single register
++ * index and a single bit shift and have to derive the rest.
++ *
++ * @pin->data_a_reg_index is the absolute (SOC15) dword register index of the
++ * DC_GPIO_<pad>_A register, i.e. DCN_BASE__INST0_SEG<n> + mmDC_GPIO_<pad>_A.
++ * Every DC_GPIO_* pad group is a fixed 4-register block in the order
++ * MASK, A, EN, Y -- e.g. on Navi 10 mmDC_GPIO_DDCVGA_MASK/_A/_EN/_Y are
++ * 0x28e8/0x28e9/0x28ea/0x28eb -- so MASK = A - 1, EN = A + 1, Y = A + 2.
++ *
++ * Within each of those registers the clock bit is bit 0 and the data bit is
++ * bit 8; the LUT entry carries the data bit shift. dc makes the same
++ * assumption, see id_to_offset() in
++ * drivers/gpu/drm/amd/display/dc/gpio/dcn20/hw_translate_dcn20.c which
++ * hardcodes DC_GPIO_DDC6_A__DC_GPIO_DDC6CLK_A_MASK / ..._DDC6DATA_A_MASK for
++ * every DDC line.
++ */
++static struct amdgpu_i2c_bus_rec
++amdgpu_atomfirmware_get_bus_rec_for_gpio_pin(struct atom_gpio_pin_assignment *pin)
++{
++	struct amdgpu_i2c_bus_rec i2c;
++	u32 a_reg;
++
++	memset(&i2c, 0, sizeof(struct amdgpu_i2c_bus_rec));
++
++	/*
++	 * Only i2c pin pairs have the MASK/A/EN/Y quad; a plain GPIO or HPD
++	 * entry (I2C_HW_CAP clear) shares one register with other pins and the
++	 * derivation below would produce nonsense for it.
++	 */
++	if (!(pin->gpio_id & I2C_HW_CAP))
++		return i2c;
++
++	if (pin->gpio_bitshift > 31 || pin->gpio_mask_bitshift > 31)
++		return i2c;
++
++	a_reg = le32_to_cpu(pin->data_a_reg_index);
++	if (a_reg < 1)
++		return i2c;
++
++	i2c.mask_clk_reg  = a_reg - 1;
++	i2c.mask_data_reg = a_reg - 1;
++	i2c.a_clk_reg     = a_reg;
++	i2c.a_data_reg    = a_reg;
++	i2c.en_clk_reg    = a_reg + 1;
++	i2c.en_data_reg   = a_reg + 1;
++	i2c.y_clk_reg     = a_reg + 2;
++	i2c.y_data_reg    = a_reg + 2;
++
++	i2c.mask_clk_mask = 1 << 0;
++	i2c.a_clk_mask    = 1 << 0;
++	i2c.en_clk_mask   = 1 << 0;
++	i2c.y_clk_mask    = 1 << 0;
++
++	i2c.mask_data_mask = 1 << pin->gpio_mask_bitshift;
++	i2c.a_data_mask    = 1 << pin->gpio_bitshift;
++	i2c.en_data_mask   = 1 << pin->gpio_bitshift;
++	i2c.y_data_mask    = 1 << pin->gpio_bitshift;
++
++	i2c.i2c_id = pin->gpio_id;
++
++	/*
++	 * Always use the bit-banging algo. amdgpu_i2c_create() would otherwise
++	 * pick amdgpu_atombios_i2c_xfer() when amdgpu_hw_i2c is set, and the
++	 * legacy ATOM hw-i2c command tables it drives do not exist in an
++	 * atomfirmware image. Keeping this false also keeps the adapter name
++	 * "AMDGPU i2c bit bus OEM 0x..", which is what userspace expects.
++	 */
++	i2c.hw_capable = false;
++	i2c.mm_i2c = false;
++	i2c.valid = true;
++
++	return i2c;
++}
++
++/**
++ * amdgpu_atomfirmware_oem_i2c_init - expose the board OEM i2c line
++ * @adev: amdgpu_device pointer
++ *
++ * The atomfirmware equivalent of amdgpu_atombios_oem_i2c_init(). Boards that
++ * hang a vendor device (RGB controller, board EEPROM, ...) off a spare i2c pin
++ * pair advertise it in the firmwareinfo table: board_i2c_feature_id == 0x2
++ * means the feature is present, board_i2c_feature_gpio_id names the gpio_id to
++ * look up in gpio_pin_lut, and board_i2c_feature_slave_addr is the device's
++ * 8-bit wire-format address (see the comment in amdgpu_ras_eeprom.c for the
++ * convention used by the sibling ras_rom_i2c_slave_addr field).
++ *
++ * dc consumes the same two fields to build its "AMDGPU DM i2c OEM bus"
++ * (dc/bios/bios_parser2.c get_firmware_info_v3_* and
++ * dc/resource/dcn20/dcn20_resource.c), but that bus is restricted to dc's
++ * software i2c engine. Registering a plain i2c-algo-bit adapter here gives an
++ * independent path to the same pads.
++ */
++void amdgpu_atomfirmware_oem_i2c_init(struct amdgpu_device *adev)
++{
++	struct amdgpu_mode_info *mode_info = &adev->mode_info;
++	struct atom_gpio_pin_lut_v2_1 *pin_lut;
++	union firmware_info *firmware_info;
++	struct amdgpu_i2c_bus_rec i2c;
++	u16 data_offset, size;
++	u8 frev, crev;
++	u8 oem_id, oem_addr;
++	int index, i, num_indices;
++	char stmp[32];
++
++	if (!mode_info->atom_context)
++		return;
++
++	index = get_index_into_master_table(atom_master_list_of_data_tables_v2_1,
++					    firmwareinfo);
++	if (!amdgpu_atom_parse_data_header(mode_info->atom_context, index,
++					   &size, &frev, &crev, &data_offset))
++		return;
++	if (frev != 3)
++		return;
++
++	firmware_info = (union firmware_info *)
++		(mode_info->atom_context->bios + data_offset);
++
++	/*
++	 * board_i2c_feature_id / _gpio_id / _slave_addr sit at the same
++	 * offsets (+0x30 / +0x31 / +0x32) in atom_firmware_info_v3_1 through
++	 * v3_5, so any of the union members will do; dc reads them through the
++	 * v3_2 layout for the same reason.
++	 */
++	if (firmware_info->v32.board_i2c_feature_id != 0x2)
++		return;
++
++	oem_id   = firmware_info->v32.board_i2c_feature_gpio_id;
++	oem_addr = firmware_info->v32.board_i2c_feature_slave_addr;
++
++	index = get_index_into_master_table(atom_master_list_of_data_tables_v2_1,
++					    gpio_pin_lut);
++	if (!amdgpu_atom_parse_data_header(mode_info->atom_context, index,
++					   &size, &frev, &crev, &data_offset))
++		return;
++	if (size < sizeof(struct atom_common_table_header) +
++		   sizeof(struct atom_gpio_pin_assignment))
++		return;
++
++	pin_lut = (struct atom_gpio_pin_lut_v2_1 *)
++		(mode_info->atom_context->bios + data_offset);
++
++	num_indices = (size - sizeof(struct atom_common_table_header)) /
++		sizeof(struct atom_gpio_pin_assignment);
++
++	for (i = 0; i < num_indices; i++) {
++		if (pin_lut->gpio_pin[i].gpio_id != oem_id)
++			continue;
++
++		/*
++		 * Sanity: the pad must live in the same 4-dword-strided block
++		 * as the other i2c pin pairs. This is what lets us derive
++		 * MASK/EN/Y from the A register index instead of hardcoding a
++		 * per-ASIC table the way dc does.
++		 */
++		if (!amdgpu_atomfirmware_gpio_pin_in_i2c_block(pin_lut,
++							       num_indices, i))
++			break;
++
++		i2c = amdgpu_atomfirmware_get_bus_rec_for_gpio_pin(
++				&pin_lut->gpio_pin[i]);
++		if (!i2c.valid)
++			break;
++
++		sprintf(stmp, "OEM 0x%x", i2c.i2c_id);
++		adev->i2c_bus[0] = amdgpu_i2c_create(adev_to_drm(adev), &i2c, stmp);
++		if (adev->i2c_bus[0])
++			dev_info(adev->dev,
++				 "OEM i2c line 0x%02x: DC_GPIO A reg 0x%05x, slave 0x%02x (7-bit 0x%02x)\n",
++				 i2c.i2c_id, i2c.a_data_reg,
++				 oem_addr, oem_addr >> 1);
++		else
++			dev_warn(adev->dev,
++				 "failed to register OEM i2c line 0x%02x\n",
++				 oem_id);
++		break;
++	}
++}
++
+ 
+ union smu_info {
+ 	struct atom_smu_info_v3_1 v31;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_i2c.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_i2c.c
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_i2c.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_i2c.c
+@@ -31,6 +31,7 @@
+ #include "amdgpu.h"
+ #include "amdgpu_i2c.h"
+ #include "amdgpu_atombios.h"
++#include "amdgpu_atomfirmware.h"
+ #include "atom.h"
+ #include "atombios_dp.h"
+ #include "atombios_i2c.h"
+@@ -217,7 +218,15 @@ out_free:
+ 
+ void amdgpu_i2c_init(struct amdgpu_device *adev)
+ {
+-	if (!adev->is_atom_fw) {
++	if (adev->is_atom_fw) {
++		/*
++		 * atomfirmware (Vega and later) has no GPIO_I2C_Info table.
++		 * The board specific i2c line, if any, is named by
++		 * firmwareinfo.board_i2c_feature_gpio_id and resolved through
++		 * the gpio_pin_lut table.
++		 */
++		amdgpu_atomfirmware_oem_i2c_init(adev);
++	} else {
+ 		if (!amdgpu_device_has_dc_support(adev)) {
+ 			amdgpu_atombios_i2c_init(adev);
+ 		} else {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -4001,9 +4001,10 @@ int amdgpu_device_init(struct amdgpu_device *adev)
+ 				amdgpu_vf_error_put(adev, AMDGIM_ERROR_VF_ATOMBIOS_GET_CLOCK_FAIL, 0, 0);
+ 				goto failed;
+ 			}
+-			/* init i2c buses */
+-			amdgpu_i2c_init(adev);
+ 		}
++
++		/* init i2c buses */
++		amdgpu_i2c_init(adev);
+ 	}
+ 
+ fence_driver_init:
+
+--------------------------------------------------------------------------------
+NOTES FOR WHOEVER BUILDS THIS
+--------------------------------------------------------------------------------
+
+* This is a hand-written diff against the v7.1.5 sources in ref/linux-7.1.5/,
+  not the output of `git diff`. The hunk headers were recomputed from the hunk
+  bodies so the line counts are self-consistent, and every hunk start line was
+  checked against the real files, but blank context lines were normalised. Apply
+  with `patch -p1 -l --fuzz=3`, or just reproduce the four edits by hand -- they
+  are small and self-contained.
+
+* adev->i2c_bus[0] is used as the storage slot. AMDGPU_MAX_I2C_BUS is 16
+  (amdgpu_mode.h:127) and nothing else populates the array on an atomfirmware
+  ASIC, so slot 0 is free. Note amdgpu_i2c_fini() only NULLs the array; the
+  adapter itself is released by devm_/i2c_bit_add_bus() teardown, same as the
+  existing Polaris path -- i.e. this patch inherits whatever lifetime handling
+  the existing code has, it does not make it worse.
+
+* IMPORTANT, if the new bus appears but still NAKs. A read-only register dump on
+  the test machine (vbios/i2c-lines.md section 8.1) shows
+  DC_GPIO_DDCVGA_MASK = 0xcf401000, i.e. DC_GPIO_DDCVGADATA_PD_EN (bit 12, the
+  internal pull-down on SDA) is ASSERTED, while bit 4 is clear. That asymmetry is
+  the signature of the GPIO_DDC_LINE_DDC_VGA special case at hw_ddc.c:97-99, and
+  the guard around it (hw_ddc.c:96) can never evaluate false on this line because
+  DDC_MASK_SH_LIST_COMMON (ddc_regs.h:96-102) makes it read bit 4 of
+  DC_GPIO_DDCVGA_MASK, a bit that register does not define
+  (grep -c 'DC_GPIO_DDCVGA_MASK__DC_GPIO_DDCVGACLK_PD_EN' -> 0). Nothing in
+  hw_ddc.c ever clears it.
+
+  amdgpu_i2c_pre_xfer() (amdgpu_i2c.c:39-79) claims the pads but does NOT clear
+  that bit, so this new bus drives the same pads with the pull-down still on.
+  Deliberately NOT changed here, because (a) pre_xfer is shared by every legacy
+  ASIC and (b) these pull-downs are usually weak enough that a board pull-up
+  wins, so it may well be a red herring. If the bus NAKs, the one-line
+  experiment is to clear bit 12 of rec->mask_data_reg in pre_xfer for this rec
+  and retry. Do that before concluding the pads are unconnected.
+
+* If you want to probe the two i2c lines this card leaves completely unbound --
+  gpio_id 0x92 (DC_GPIO_DDC3, a_reg 0x5D99) and 0x94 (DC_GPIO_DDC5,
+  a_reg 0x5DA1) -- the cheapest experiment is to loop over every gpio_pin_lut
+  entry with (gpio_id & 0x80) instead of matching only oem_id, and register each
+  one that no dc link claims. That is deliberately NOT in this patch: it would
+  add adapters on pads that dc also drives for DDC, and the two lines are not
+  named by anything in the VBIOS.
+
+* Verification steps are in vbios/i2c-lines.md section 9. In short: expect a new
+  adapter named exactly "AMDGPU i2c bit bus OEM 0x97" plus a dev_info line, then
+  a single-address read `i2cget -y <newbus> 0x28`. Do not run i2cdetect sweeps.
